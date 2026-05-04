@@ -1,21 +1,18 @@
-from typing import Annotated
-from fastapi import Cookie, FastAPI, Response, WebSocket, Request, WebSocketDisconnect
-from fastapi.responses import FileResponse, HTMLResponse
+from contextlib import asynccontextmanager
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
-from dataclasses import dataclass
+from fastapi import FastAPI, Response, Request
 import random, string
 import uuid
 
-
+from .router.lobby import router as r
 
 app = FastAPI()
+app.include_router(r)
 
-
-
-
-
-
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    app.mount("/", StaticFiles(directory="./../public_test", html=True), name="index")
+    yield
 
 @app.middleware("http")
 async def add_process_time_header(request: Request, call_next):
@@ -32,6 +29,6 @@ async def add_process_time_header(request: Request, call_next):
     response.set_cookie(key="user_id", value=cookie_val, httponly=True, secure=False)
     return response
 
-app.mount("/", StaticFiles(directory="./../public_test", html=True), name="index")
-
+def rnd_str(n: int) -> str:
+    return ''.join(random.choices(string.ascii_uppercase + string.digits, k=n))
 

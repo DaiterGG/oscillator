@@ -1,5 +1,6 @@
 import time
 import asyncio
+import traceback
 
 from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
 
@@ -12,151 +13,155 @@ router = APIRouter()
 async def broadcast_lobby_sync(lobby: Lobby):
     user_list = []
     for uid, u in lobby.users.items():
-        user_list.append({
-            "user_id": uid,
-            "user_name": u.user_name,
-            "status": u.status,
-            "join_time": u.join_time
-        })
+        if u.status == "connected":
+            user_list.append({
+                "user_id": uid,
+                "user_name": u.user_name,
+                "status": u.status,
+                "join_time": u.join_time
+            })
     
     for _, user in lobby.users.items():
         if user.status == "connected":
-            await user.socket.send_json({
+            data = {
                 "type": "lobby_sync",
                 "users": user_list,
                 "author_id": lobby.author.author_id,
                 "lobby_name": lobby.lobby_name,
                 "theme": lobby.theme,
                 "description": lobby.description
-            })
+            }
+            # Only send password to the owner
+            if user.socket.cookies["user_id"] == lobby.author.author_id:
+                data["password"] = lobby.password
+            
+            await user.socket.send_json(data)
 
 @router.websocket("/api/join_lobby")
 async def join_lobby(ws: WebSocket):
-    user = await parse_and_connect(ws)
+    try:
+        await join(ws)
+    except Exception:
+        traceback.print_exc()
+    finally:
+        lobby_id = ws.query_params["lobby_id"]
+        if lobby_id:
+            lobbies.delete_if_empty(lobby_id)
+
+
+async def join(ws: WebSocket):
+    await ws.accept()
+    
+    # 1. Initial Handshake: Get user/lobby info from query params
+    try:
+        user_name = ws.query_params["user_name"]
+        lobby_id = ws.query_params["lobby_id"]
+        u_id = ws.cookies["user_id"]
+    except Exception:
+        await ws.close(code=4000, reason="Missing credentials")
+        return
+
+    # Verify Lobby
+    lobby = lobbies.lobbies.get(lobby_id)
+    if not lobby:
+        await ws.close(code=4004, reason="Lobby not found")
+        return
+    author_user = lobby.users.get(lobby.author.author_id)
+    if author_user and author_user.status != "connected":
+        await ws.close(code=4004, reason="Lobby not found")
+        return
+
+    # 2. Challenge Phase (if protected and user is not author)
+    if lobby.is_password_protected() and u_id != lobby.author.author_id:
+        while True:
+            await ws.send_json({"type": "challenge", "reason": "password_required"})
+            
+            # Wait for password submission
+            try:
+                resp = await ws.receive_json()
+                if resp.get("type") == "password_submit":
+                    password = resp.get("password")
+                else:
+                    await ws.close(code=4003, reason="Expected password_submit")
+                    return
+            except Exception:
+                await ws.close(code=4000, reason="Handshake failed")
+                return
+
+            # Validate password
+            if lobby.password == password:
+                break # Correct password
+            else:
+                await ws.send_json({"type": "auth_error", "message": "Wrong password"})
+                # Loop continues for retry
+
+    # Handle reconnection or new join
+    if u_id in lobby.users:
+        user = lobby.users[u_id]
+        if user.status == "disconnected":
+            if user.reconnect_task: user.reconnect_task.cancel()
+            user.status = "connected"
+            user.socket = ws
+            # Send sync and chat history to the reconnected user
+            await broadcast_lobby_sync(lobby)
+            await ws.send_json({"type": "player_chat_history", "messages": lobby.player_history})
+            await ws.send_json({"type": "lobby_chat_history", "messages": lobby.lobby_history})
+        else:
+            await ws.close(code=4009, reason="already connected")
+            return
+    else:
+        user = ConnectedUser(user_name=user_name, lobby_id=lobby_id, socket=ws)
+        lobby.users[u_id] = user
+        await broadcast_lobby_sync(lobby)
+        await ws.send_json({"type": "player_chat_history", "messages": lobby.player_history})
+        await ws.send_json({"type": "lobby_chat_history", "messages": lobby.lobby_history})
+        for other_id, other_user in lobby.users.items():
+            if other_id != u_id:
+                try: 
+                    await other_user.socket.send_json({"type": "user_joined", "user_id": u_id, "user_name": user_name, "join_time": user.join_time})
+                except:
+                    pass
+
     try:
         while True:
             await websocket_read_message(user)
     except WebSocketDisconnect:
-        print("Client disconnected")
+        pass
     finally:
-        async def delayed_disconnect():
-            await asyncio.sleep(3)
-            if user.status == "disconnected":
-                try:
-                    lobby = lobbies.get_or_status(user.lobby_id, 200)
-                    u_id = user.socket.state.user_id
-
-                    if u_id == lobby.author.author_id:
-                        result = lobby.get_new_owner()
-                        if result:
-                            new_owner_id, new_owner_user, new_secret = result
-                            lobby.transfer_ownership(new_owner_id, new_secret)
-                            # Sync after ownership transfer
-                            await broadcast_lobby_sync(lobby)
-
-                    for other_id, other_user in lobby.users.items():
-                        if other_id != u_id:
-                            await other_user.socket.send_json({
-                                "type": "user_left",
-                                "user_id": u_id,
-                                "user_name": user.user_name
-                            })
-                    
-                    # Sync after leave
-                    await broadcast_lobby_sync(lobby)
-                except Exception as e:
-                    print(f"Failed to notify other users of leave: {e}")
-                await lobbies.disconnect_user(user.lobby_id, user.socket.state.user_id)
-
         user.status = "disconnected"
-        user.reconnect_task = asyncio.create_task(delayed_disconnect())
-
-
-
-async def parse_and_connect(ws: WebSocket) -> ConnectedUser:
-    print("connecting")
-    try:
-        user_name = ws.query_params["user_name"]
-        print(f"user {user_name} connecting")
-        lobby_id = ws.query_params["lobby_id"]
-        print(f"to lobby {lobby_id}")
-        u_id = ws.cookies["user_id"]
-        u_secret = ws.cookies["user_secret"]
-    except:
-        await ws.close()
-        raise HTTPException(status_code=400, detail="credentials was not provided")
-
-    # manually set state for ws://
-    ws.state.user_id = u_id
-    ws.state.user_secret = u_secret
-
-    lobby = lobbies.get_or_status(lobby_id, 400)
-
-    password = ws.query_params.get("password")
-    if lobby.is_password_protected() and lobby.password != password:
-         raise HTTPException(status_code=401, detail="wrong password")
-
-    # Handle reconnection
-    if u_id in lobby.users:
-        user = lobby.users[u_id]
+        await broadcast_lobby_sync(lobby)
+        
+        for other_id, other_user in lobby.users.items():
+            if other_id != u_id and other_user.status == "connected":
+                try:
+                    await other_user.socket.send_json({"type": "user_left", "user_id": u_id, "user_name": user.user_name})
+                except:
+                    pass
+        
+        # Wait 3 seconds and remove if still disconnected
+        await asyncio.sleep(3)
         if user.status == "disconnected":
-            print(f"Reconnecting user {u_id}")
-            if user.reconnect_task:
-                user.reconnect_task.cancel()
-            user.status = "connected"
-            user.socket = ws
-            await ws.accept()
-            
-            # Send sync and chat history to the reconnected user
-            await broadcast_lobby_sync(lobby)
-            for m in lobby.player_history:
-                await ws.send_json(m)
-            for m in lobby.lobby_history:
-                await ws.send_json(m)
-            
-            return user
-        else:
-            raise HTTPException(status_code=409, detail="you are already connected in a different tab")
+            if u_id in lobby.users:
+                del lobby.users[u_id]
+                await broadcast_lobby_sync(lobby)
 
-    await ws.accept()
 
-    connected = ConnectedUser(user_name=user_name, lobby_id=lobby_id, socket=ws)
 
-    lobby.users[u_id] = connected
-
-    # Sync after join
-    await broadcast_lobby_sync(lobby)
-    
-    # Send chat history
-    for m in lobby.player_history:
-        await ws.send_json(m)
-    for m in lobby.lobby_history:
-        await ws.send_json(m)
-
-    # Notify other users in the lobby that a new user joined
-    for other_id, other_user in lobby.users.items():
-        if other_id != u_id:
-            try:
-                await other_user.socket.send_json({
-                    "type": "user_joined",
-                    "user_id": u_id,
-                    "user_name": user_name,
-                    "join_time": connected.join_time
-                })
-            except Exception as e:
-                print(f"Failed to notify user {other_user.user_name} of join: {e}")
-
-    return connected
 
 async def websocket_read_message(user: ConnectedUser):
-
     mes = await user.socket.receive_json()
+    user_id = user.socket.cookies["user_id"]
+    user_secret = user.socket.cookies["user_secret"]
     print("read message")
     if mes["type"] in ["player_chat", "lobby_chat"]:
         mes["stamp"] = str(time.time())
         mes["user_name"] = user.user_name
-        mes["user_id"] = user.socket.state.user_id
-        lobby = lobbies.get_or_status(user.lobby_id, 400)
+        mes["user_id"] = user_id
+
+        lobby = lobbies.lobbies.get(user.lobby_id)
+        if not lobby:
+            await user.socket.close(code=4004, reason="lobby not found")
+            return
         
         if mes["type"] == "player_chat":
             lobby.player_history.append(mes)
@@ -171,9 +176,15 @@ async def websocket_read_message(user: ConnectedUser):
     elif mes["type"] == "test_ping":
         await user.socket.send_json(mes)
     elif mes["type"] == "update_lobby_settings":
-        lobby = lobbies.get_or_status(user.lobby_id, 400)
-        # Check if the requester is the current owner using the lobby_secret
-        if user.socket.state.user_id == lobby.author.author_id and user.socket.state.user_secret == lobby.author.lobby_secret:
+        lobby = lobbies.lobbies.get(user.lobby_id)
+        if not lobby:
+            await user.socket.close(code=4004, reason="lobby not found")
+            return
+        
+        # Correct check: requester must be author AND provide the correct lobby_secret
+        provided_secret = mes.get("lobby_secret") 
+        
+        if user_id == lobby.author.author_id and provided_secret == lobby.author.lobby_secret:
             if "lobby_name" in mes:
                 lobby.lobby_name = mes["lobby_name"] if mes["lobby_name"].strip() else "None"
             if "theme" in mes:
@@ -181,18 +192,26 @@ async def websocket_read_message(user: ConnectedUser):
             if "description" in mes:
                 lobby.description = mes["description"] if mes["description"].strip() else "None"
             if "password" in mes:
-                lobby.password = mes["password"]
+                new_password = mes["password"]
+                lobby.password = new_password if new_password and new_password.strip() else None
             
             await broadcast_lobby_sync(lobby)
 
     elif mes["type"] == "set_owner":
-        lobby = lobbies.get_or_status(user.lobby_id, 400)
-        # Check if the requester is the current owner using the lobby_secret
-        if user.socket.state.user_id == lobby.author.author_id and user.socket.state.user_secret == lobby.author.lobby_secret:
+        lobby = lobbies.lobbies.get(user.lobby_id)
+        if not lobby:
+            await user.socket.close(code=4004, reason="lobby not found")
+            return
+        
+        # Correct check: requester must be author AND provide the correct lobby_secret
+        provided_secret = mes.get("lobby_secret")
+
+        if user_id == lobby.author.author_id and provided_secret == lobby.author.lobby_secret:
             new_owner_id = mes.get("new_owner_id")
             if new_owner_id in lobby.users:
-                # Assuming transfer_ownership handles the update of lobby.author
-                lobby.transfer_ownership(new_owner_id, lobby.users[new_owner_id].user_secret)
+                import uuid
+                new_lobby_secret = str(uuid.uuid4())
+                lobby.transfer_ownership(new_owner_id, new_lobby_secret)
                 await broadcast_lobby_sync(lobby)
 
 """

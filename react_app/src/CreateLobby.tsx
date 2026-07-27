@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
+import EyeIcon from "./components/icons/EyeIcon";
 
 export default function CreateLobby({ onClose }: { onClose: () => void }) {
   const [lobbyName, setLobbyName] = useState("");
@@ -7,6 +8,7 @@ export default function CreateLobby({ onClose }: { onClose: () => void }) {
   const [description, setDescription] = useState("");
   const [isProtected, setIsProtected] = useState(false);
   const [password, setPassword] = useState("");
+  const [showPassword, setShowPassword] = useState(false);
   const [passwordError, setPasswordError] = useState(false);
 
   const navigate = useNavigate();
@@ -89,17 +91,26 @@ export default function CreateLobby({ onClose }: { onClose: () => void }) {
 
         {isProtected && (
           <div className="w-full flex flex-col gap-1">
-            <input
-              type="password"
-              placeholder="Password"
-              value={password}
-              onChange={(e) => {
-                  setPassword(e.target.value);
-                  if (passwordError) setPasswordError(false);
-              }}
-              autoComplete="new-password"
-              className={`w-full p-3 rounded-xl border-2 ${passwordError ? 'border-red-500' : 'border-white/70'} bg-[#101010] text-white`}
-            />
+            <div className="relative">
+              <input
+                type={showPassword ? "text" : "password"}
+                placeholder="Password"
+                value={password}
+                onChange={(e) => {
+                    setPassword(e.target.value);
+                    if (passwordError) setPasswordError(false);
+                }}
+                autoComplete="new-password"
+                className={`w-full p-3 rounded-xl border-2 ${passwordError ? 'border-red-500' : 'border-white/70'} bg-[#101010] text-white`}
+              />
+              <button
+                type="button"
+                onClick={() => setShowPassword(!showPassword)}
+                className="absolute right-3 top-1/2 -translate-y-1/2 text-white/50 hover:text-white"
+              >
+                <EyeIcon className="w-5 h-5" />
+              </button>
+            </div>
             {passwordError && <span className="text-red-500 text-sm">Password is required.</span>}
           </div>
         )}

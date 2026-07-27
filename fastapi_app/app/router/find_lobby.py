@@ -48,21 +48,3 @@ async def find_lobby(lobby_page: int = 1):
         i += 1
 
     return {"lobbies": lobby_list}
-
-
-@router.get("/api/lobby_details")
-async def lobby_details(lobby_id: str):
-    lobby = lobbies.get_or_status(lobby_id, 404)
-    user_list = []
-    for uid, u in lobby.users.items():
-        user_list.append({
-            "user_id": uid,
-            "user_name": u.user_name
-        })
-    return {
-        "lobby_id": lobby_id,
-        "lobby_name": lobby.lobby_name,
-        "author_id": lobby.author.author_id,
-        "author_name": lobby.author.author_name,
-        "users": user_list
-    }

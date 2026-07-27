@@ -276,7 +276,7 @@ export default function LobbyPage() {
               )}
             </div>
             <div className="flex flex-col gap-2 pt-2 pb-2">
-              <div className="flex items-center justify-between gap-2 text-white/50 pb-2 border-b-2 border-white/70 w-full px-2">
+              <div className="flex items-center justify-center gap-6 text-white/50 pb-2 border-b-2 border-white/70 w-full px-2">
                 <button 
                     onClick={() => setIsShuffling(!isShuffling)} 
                     disabled={musicControlsLocked}

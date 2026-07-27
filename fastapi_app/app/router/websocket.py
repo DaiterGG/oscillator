@@ -57,6 +57,7 @@ async def join(ws: WebSocket):
         user_name = ws.query_params["user_name"]
         lobby_id = ws.query_params["lobby_id"]
         u_id = ws.cookies["user_id"]
+        print(f"DEBUG: Connecting user_id={u_id}, lobby_id={lobby_id}")
     except Exception:
         await ws.close(code=4000, reason="Missing credentials")
         return
@@ -66,10 +67,11 @@ async def join(ws: WebSocket):
     if not lobby:
         await ws.close(code=4004, reason="Lobby not found")
         return
-    author_user = lobby.users.get(lobby.author.author_id)
-    if author_user and author_user.status != "connected":
-        await ws.close(code=4004, reason="Lobby not found")
-        return
+    # The author might not be connected yet
+    # author_user = lobby.users.get(lobby.author.author_id)
+    # if author_user and author_user.status != "connected":
+    #     await ws.close(code=4004, reason="Lobby not found")
+    #     return
 
     # 2. Challenge Phase (if protected and user is not author)
     if lobby.is_password_protected() and u_id != lobby.author.author_id:

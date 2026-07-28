@@ -10,6 +10,7 @@ import SkipBackIcon from "./components/icons/SkipBackIcon";
 import SkipForwardIcon from "./components/icons/SkipForwardIcon";
 import RepeatIcon from "./components/icons/RepeatIcon";
 import ShuffleIcon from "./components/icons/ShuffleIcon";
+import SpinnerIcon from "./components/icons/SpinnerIcon";
 
 export default function LobbyPage() {
   const location = useLocation();
@@ -402,6 +403,7 @@ export default function LobbyPage() {
                     />
                   ) : (
                     <>
+                      {u.status === 'disconnected' && <SpinnerIcon className="w-4 h-4 text-white/50" />}
                       {u.user_name}
                       {u.user_id === authorId && <CrownIcon className="w-4 h-4 text-white" />}
                     </>

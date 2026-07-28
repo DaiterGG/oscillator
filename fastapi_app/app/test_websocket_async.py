@@ -1,44 +1,278 @@
-# import pytest
-# from fastapi.testclient import TestClient
-# from .main import app
+import asyncio
+import json
+import socket
+from multiprocessing import Process
+from uuid import UUID
 
-# def test_async_lobby_chat():
-#     client1 = TestClient(app, base_url="https://testserver")
-#     client2 = TestClient(app, base_url="https://testserver")
-    
-#     # Create lobby with client1
-#     res = client1.post("/api/create_lobby", json={
-#         "user_name": "owner", 
-#         "lobby_name": "async test", 
-#         "lobby_theme": "rock", 
-#         "lobby_description": "test"
-#     })
-#     l_id = res.json()["lobby_id"]
+import httpx
+import pytest
+import uvicorn
+import websockets
 
-#     # Register client2 to get its own unique cookies
-#     client2.get("/api/ping") 
+from .main import app
 
-#     def client_session(client, nickname, message_body):
-#         url = f"/api/join_lobby?lobby_id={l_id}&user_name={nickname}"
+
+HOST = "127.0.0.1"
+
+
+def get_free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind((HOST, 0))
+        return sock.getsockname()[1]
+
+
+def run_server(port: int) -> None:
+    uvicorn.run(
+        app,
+        host=HOST,
+        port=port,
+        log_level="error",
+    )
+
+
+async def wait_for_server(port: int) -> None:
+    for _ in range(50):
+        try:
+            reader, writer = await asyncio.open_connection(HOST, port)
+
+            writer.close()
+            await writer.wait_closed()
+
+            return
+
+        except ConnectionRefusedError:
+            await asyncio.sleep(0.1)
+
+    raise RuntimeError("Test server did not start")
+
+
+@pytest.fixture
+def server():
+    port = get_free_port()
+
+    process = Process(
+        target=run_server,
+        args=(port,),
+        daemon=True,
+    )
+
+    process.start()
+
+    # Wait until Uvicorn is ready
+    asyncio.run(wait_for_server(port))
+
+    yield {
+        "http": f"http://{HOST}:{port}",
+        "ws": f"ws://{HOST}:{port}",
+    }
+
+    process.terminate()
+    process.join(timeout=5)
+
+    if process.is_alive():
+        process.kill()
+
+
+# Helper function to receive and decode JSON messages
+async def recv_json(ws):
+    return json.loads(await ws.recv())
+
+
+@pytest.mark.asyncio
+async def test_lobby_chat(server):
+    http_base_url = server["http"]
+    ws_base_url = server["ws"]
+
+    # ---------------------------------------------------------
+    # Create lobby
+    # ---------------------------------------------------------
+
+    async with httpx.AsyncClient(
+        base_url=http_base_url
+    ) as client:
+
+        response = await client.post(
+            "/api/create_lobby",
+            json={
+                "user_name": "name1",
+                "lobby_name": "join me",
+                "lobby_theme": "rock",
+                "lobby_description": "test",
+            },
+        )
+
+    assert response.status_code == 200
+
+    lobby_id = response.json()["lobby_id"]
+
+    # Verify that the lobby ID is actually a UUID
+    UUID(lobby_id)
+
+    # We need to get the user_id and user_secret for the cookies
+    async with httpx.AsyncClient(base_url=http_base_url) as client:
+        # Create cookies by doing dummy requests
+        await client.get("/api/ping")
+        john_cookies = client.cookies
         
-#         with client.websocket_connect(url) as ws:
-#             # 1. Receive initial sync message
-#             ws.receive_json() 
-#             # 2. Receive chat history messages (player + lobby)
-#             ws.receive_json() 
-#             ws.receive_json() 
+    async with httpx.AsyncClient(base_url=http_base_url) as client:
+        await client.get("/api/ping")
+        mark_cookies = client.cookies
 
-#             # 3. Send message
-#             ws.send_json({"type": "lobby_chat", "body": message_body})
+    # ---------------------------------------------------------
+    # Build WebSocket URLs
+    # ---------------------------------------------------------
 
-#             # 4. We cannot easily receive the *other* user's broadcast because of the 
-#             # sequential TestClient nature. For now, just return that sending was successful.
-#             return {"body": message_body}
+    john_url = (
+        f"{ws_base_url}/api/join_lobby"
+        f"?lobby_id={lobby_id}"
+        f"&user_name=john"
+        f"&user_id={john_cookies['user_id']}&user_secret={john_cookies['user_secret']}"
+    )
 
-#     # Running sequentially
-#     res1 = client_session(client1, "user1", "hi from 1")
-#     res2 = client_session(client2, "user2", "hi from 2")
+    mark_url = (
+        f"{ws_base_url}/api/join_lobby"
+        f"?lobby_id={lobby_id}"
+        f"&user_name=mark"
+        f"&user_id={mark_cookies['user_id']}&user_secret={mark_cookies['user_secret']}"
+    )
 
-#     # Verify results
-#     assert res1["body"] == "hi from 1"
-#     assert res2["body"] == "hi from 2"
+    async with (
+        websockets.connect(john_url) as john,
+        websockets.connect(mark_url) as mark,
+    ):
+
+
+        # -----------------------------------------------------
+        # Send messages concurrently
+        # -----------------------------------------------------
+
+        await asyncio.gather(
+            john.send(
+                json.dumps(
+                    {
+                        "type": "player_chat",
+                        "body": "hi mark",
+                    }
+                )
+            ),
+            mark.send(
+                json.dumps(
+                    {
+                        "type": "player_chat",
+                        "body": "hi john",
+                    }
+                )
+            ),
+        )
+
+        # -----------------------------------------------------
+        # Receive messages (Lobby Sync + Chat)
+        # -----------------------------------------------------
+        
+        async def get_chat_message(ws, sender_name):
+            while True:
+                msg = await recv_json(ws)
+                if msg.get("type") == "player_chat" and msg.get("user_name") != sender_name:
+                    return msg
+        
+        john_message, mark_message = await asyncio.wait_for(asyncio.gather(
+            get_chat_message(john, "john"),
+            get_chat_message(mark, "mark"),
+        ), timeout=10)
+
+        # -----------------------------------------------------
+        # Assert that each user received the other user's message
+        # -----------------------------------------------------
+
+        assert john_message["body"] == "hi john"
+        assert mark_message["body"] == "hi mark"
+
+
+@pytest.mark.asyncio
+async def test_ownership_transfer_on_leave(server):
+    http_base_url = server["http"]
+    ws_base_url = server["ws"]
+
+    async with httpx.AsyncClient(base_url=http_base_url) as client:
+        response = await client.post(
+            "/api/create_lobby",
+            json={"user_name": "owner", "lobby_name": "transfer test", "lobby_theme": "rock", "lobby_description": "test"},
+        )
+        owner_cookies = client.cookies
+    lobby_id = response.json()["lobby_id"]
+
+    # Prepare URLs
+    async with httpx.AsyncClient(base_url=http_base_url) as c:
+        await c.get("/api/ping")
+        user2_cookies = c.cookies
+
+    owner_url = f"{ws_base_url}/api/join_lobby?lobby_id={lobby_id}&user_name=owner&user_id={owner_cookies['user_id']}&user_secret={owner_cookies['user_secret']}"
+    user2_url = f"{ws_base_url}/api/join_lobby?lobby_id={lobby_id}&user_name=user2&user_id={user2_cookies['user_id']}&user_secret={user2_cookies['user_secret']}"
+
+    async with websockets.connect(owner_url) as owner_ws, websockets.connect(user2_url) as user2_ws:
+        # Consume sync messages
+        for _ in range(3):
+            await owner_ws.recv()
+            await user2_ws.recv()
+        
+        # Owner leaves
+        await owner_ws.close()
+        
+        # Wait for auto-transfer (sleep > 3s)
+        await asyncio.sleep(4)
+        
+        # Check for owner_promoted
+        try:
+            while True:
+                msg = await asyncio.wait_for(recv_json(user2_ws), timeout=5)
+                if msg["type"] == "owner_promoted":
+                    assert "new_secret" in msg
+                    break
+                else:
+                    print(f"DEBUG: ignoring message type={msg['type']}")
+        except asyncio.TimeoutError:
+            pytest.fail("Timed out waiting for owner_promoted message")
+
+
+@pytest.mark.asyncio
+async def test_user_reconnection(server):
+    http_base_url = server["http"]
+    ws_base_url = server["ws"]
+
+    async with httpx.AsyncClient(base_url=http_base_url) as client:
+        response = await client.post(
+            "/api/create_lobby",
+            json={"user_name": "owner", "lobby_name": "reconnect test", "lobby_theme": "rock", "lobby_description": "test"},
+        )
+        owner_cookies = client.cookies
+    lobby_id = response.json()["lobby_id"]
+
+    owner_url = f"{ws_base_url}/api/join_lobby?lobby_id={lobby_id}&user_name=owner&user_id={owner_cookies['user_id']}&user_secret={owner_cookies['user_secret']}"
+
+    # Connect
+    async with websockets.connect(owner_url) as ws:
+        # Consume sync
+        await ws.recv()
+        await ws.recv()
+        await ws.recv()
+        
+        # Disconnect
+        await ws.close()
+        
+    # Wait for the server to process the disconnection
+    await asyncio.sleep(0.5)
+
+    # Reconnect immediately (within 3s)
+    try:
+        async with websockets.connect(owner_url) as ws:
+            # Should get sync messages again
+            # The user was 'disconnected' but not removed yet, so it should re-join
+            msg = await asyncio.wait_for(recv_json(ws), timeout=5)
+            assert msg["type"] == "lobby_sync"
+
+            # Verify status is connected (implicit in lobby_sync if they appear)
+            assert any(u["user_id"] == owner_cookies["user_id"] and u["status"] == "connected" for u in msg["users"])
+    except websockets.exceptions.ConnectionClosedError as e:
+        print(f"DEBUG: Connection closed with error: {e}")
+        raise
+

@@ -13,13 +13,13 @@ router = APIRouter()
 async def broadcast_lobby_sync(lobby: Lobby):
     user_list = []
     for uid, u in lobby.users.items():
-        if u.status == "connected":
-            user_list.append({
-                "user_id": uid,
-                "user_name": u.user_name,
-                "status": u.status,
-                "join_time": u.join_time
-            })
+        # Include all users, even disconnected ones, so they show up in the lobby list
+        user_list.append({
+            "user_id": uid,
+            "user_name": u.user_name,
+            "status": u.status,
+            "join_time": u.join_time
+        })
     
     for _, user in lobby.users.items():
         if user.status == "connected":
@@ -32,7 +32,7 @@ async def broadcast_lobby_sync(lobby: Lobby):
                 "description": lobby.description
             }
             # Only send password to the owner
-            if user.socket.cookies["user_id"] == lobby.author.author_id:
+            if user.socket.cookies.get("user_id") == lobby.author.author_id:
                 data["password"] = lobby.password
             
             await user.socket.send_json(data)
@@ -56,8 +56,14 @@ async def join(ws: WebSocket):
     try:
         user_name = ws.query_params["user_name"]
         lobby_id = ws.query_params["lobby_id"]
-        u_id = ws.cookies["user_id"]
-        print(f"DEBUG: Connecting user_id={u_id}, lobby_id={lobby_id}")
+        # Fallback to query params for testing if not in cookies
+        u_id = ws.cookies.get("user_id") or ws.query_params.get("user_id")
+        u_secret = ws.cookies.get("user_secret") or ws.query_params.get("user_secret")
+        
+        if not u_id or not u_secret:
+             # If not provided in cookies OR query params, fail
+             raise Exception("Missing credentials")
+             
     except Exception:
         await ws.close(code=4000, reason="Missing credentials")
         return
@@ -67,11 +73,12 @@ async def join(ws: WebSocket):
     if not lobby:
         await ws.close(code=4004, reason="Lobby not found")
         return
-    # The author might not be connected yet
-    # author_user = lobby.users.get(lobby.author.author_id)
-    # if author_user and author_user.status != "connected":
-    #     await ws.close(code=4004, reason="Lobby not found")
-    #     return
+        
+    author_user = lobby.users.get(lobby.author.author_id)
+    # If author is disconnected, deny everyone except the author
+    if author_user and author_user.status == "disconnected" and u_id != lobby.author.author_id:
+        await ws.close(code=4004, reason="Lobby not found")
+        return
 
     # 2. Challenge Phase (if protected and user is not author)
     if lobby.is_password_protected() and u_id != lobby.author.author_id:
@@ -133,27 +140,36 @@ async def join(ws: WebSocket):
         user.status = "disconnected"
         await broadcast_lobby_sync(lobby)
         
-        for other_id, other_user in lobby.users.items():
-            if other_id != u_id and other_user.status == "connected":
-                try:
-                    await other_user.socket.send_json({"type": "user_left", "user_id": u_id, "user_name": user.user_name})
-                except:
-                    pass
-        
         # Wait 3 seconds and remove if still disconnected
         await asyncio.sleep(3)
         if user.status == "disconnected":
             if u_id in lobby.users:
+                # If the owner leaves, transfer ownership
+                if u_id == lobby.author.author_id:
+                    new_owner = lobby.get_new_owner()
+                    if new_owner:
+                        new_owner_id, new_owner_user, new_secret = new_owner
+                        lobby.transfer_ownership(new_owner_id, new_secret)
+                        # Notify the new owner of the new secret
+                        await new_owner_user.socket.send_json({"type": "owner_promoted", "new_secret": new_secret})
+                        await broadcast_lobby_sync(lobby)
+
                 del lobby.users[u_id]
                 await broadcast_lobby_sync(lobby)
-
-
-
+                
+                # Notify other users only when the user is actually removed
+                for other_id, other_user in lobby.users.items():
+                    if other_id != u_id and other_user.status == "connected":
+                        try:
+                            await other_user.socket.send_json({"type": "user_left", "user_id": u_id, "user_name": user.user_name})
+                        except:
+                            pass
 
 async def websocket_read_message(user: ConnectedUser):
     mes = await user.socket.receive_json()
-    user_id = user.socket.cookies["user_id"]
-    user_secret = user.socket.cookies["user_secret"]
+    # Fallback to query params for testing if not in cookies
+    user_id = user.socket.cookies.get("user_id") or user.socket.query_params.get("user_id")
+    user_secret = user.socket.cookies.get("user_secret") or user.socket.query_params.get("user_secret")
     print("read message")
     if mes["type"] in ["player_chat", "lobby_chat"]:
         mes["stamp"] = str(time.time())

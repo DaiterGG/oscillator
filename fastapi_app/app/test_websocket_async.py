@@ -263,16 +263,169 @@ async def test_user_reconnection(server):
     await asyncio.sleep(0.5)
 
     # Reconnect immediately (within 3s)
-    try:
-        async with websockets.connect(owner_url) as ws:
-            # Should get sync messages again
-            # The user was 'disconnected' but not removed yet, so it should re-join
-            msg = await asyncio.wait_for(recv_json(ws), timeout=5)
-            assert msg["type"] == "lobby_sync"
+    async with websockets.connect(owner_url) as ws:
+        # Should get sync messages again
+        # The user was 'disconnected' but not removed yet, so it should re-join
+        msg = await asyncio.wait_for(recv_json(ws), timeout=5)
+        assert msg["type"] == "lobby_sync"
 
-            # Verify status is connected (implicit in lobby_sync if they appear)
-            assert any(u["user_id"] == owner_cookies["user_id"] and u["status"] == "connected" for u in msg["users"])
-    except websockets.exceptions.ConnectionClosedError as e:
-        print(f"DEBUG: Connection closed with error: {e}")
-        raise
+        # Verify status is connected (implicit in lobby_sync if they appear)
+        assert any(u["user_id"] == owner_cookies["user_id"] and u["status"] == "connected" for u in msg["users"])
+
+
+@pytest.mark.asyncio
+async def test_manual_ownership_transfer(server):
+    http_base_url = server["http"]
+    ws_base_url = server["ws"]
+
+    async with httpx.AsyncClient(base_url=http_base_url) as client:
+        # Create lobby as owner
+        response = await client.post(
+            "/api/create_lobby",
+            json={"user_name": "owner", "lobby_name": "transfer test", "lobby_theme": "rock", "lobby_description": "test"},
+        )
+        owner_cookies = client.cookies
+    lobby_id = response.json()["lobby_id"]
+    lobby_secret = response.json()["lobby_secret"]
+
+    # User 2 joins
+    async with httpx.AsyncClient(base_url=http_base_url) as c:
+        await c.get("/api/ping")
+        user2_cookies = c.cookies
+        
+    owner_url = f"{ws_base_url}/api/join_lobby?lobby_id={lobby_id}&user_name=owner&user_id={owner_cookies['user_id']}&user_secret={owner_cookies['user_secret']}"
+    user2_url = f"{ws_base_url}/api/join_lobby?lobby_id={lobby_id}&user_name=user2&user_id={user2_cookies['user_id']}&user_secret={user2_cookies['user_secret']}"
+
+    async with websockets.connect(owner_url) as owner_ws, websockets.connect(user2_url) as user2_ws:
+        # Consume initial sync messages for both
+        for _ in range(3):
+            await owner_ws.recv()
+            await user2_ws.recv()
+        
+        # Owner transfers ownership
+        await owner_ws.send(json.dumps({
+            "type": "set_owner",
+            "new_owner_id": user2_cookies["user_id"],
+            "lobby_secret": lobby_secret
+        }))
+        
+        # Owner should get a sync message indicating change
+        while True:
+            msg = await asyncio.wait_for(recv_json(owner_ws), timeout=5)
+            if msg["type"] == "lobby_sync" and msg["author_id"] == user2_cookies["user_id"]:
+                break
+        
+        # User2 should also get the sync message
+        msg2 = await asyncio.wait_for(recv_json(user2_ws), timeout=5)
+        assert msg2["type"] == "lobby_sync"
+        assert msg2["author_id"] == user2_cookies["user_id"]
+
+
+@pytest.mark.asyncio
+async def test_chat_history_on_join(server):
+    http_base_url = server["http"]
+    ws_base_url = server["ws"]
+
+    async with httpx.AsyncClient(base_url=http_base_url) as client:
+        # Create lobby
+        response = await client.post(
+            "/api/create_lobby",
+            json={"user_name": "owner", "lobby_name": "history test", "lobby_theme": "rock", "lobby_description": "test"},
+        )
+        owner_cookies = client.cookies
+    lobby_id = response.json()["lobby_id"]
+
+    # Prepare user URLs
+    async with httpx.AsyncClient(base_url=http_base_url) as c:
+        await c.get("/api/ping")
+        owner_cookies = c.cookies
+    async with httpx.AsyncClient(base_url=http_base_url) as c:
+        await c.get("/api/ping")
+        user2_cookies = c.cookies
+
+    owner_url = f"{ws_base_url}/api/join_lobby?lobby_id={lobby_id}&user_name=owner&user_id={owner_cookies['user_id']}&user_secret={owner_cookies['user_secret']}"
+    user2_url = f"{ws_base_url}/api/join_lobby?lobby_id={lobby_id}&user_name=user2&user_id={user2_cookies['user_id']}&user_secret={user2_cookies['user_secret']}"
+
+    # Owner joins
+    async with websockets.connect(owner_url) as owner_ws:
+        # Consume sync
+        for _ in range(3):
+            await owner_ws.recv()
+            
+        # Owner sends a chat message
+        await owner_ws.send(json.dumps({"type": "player_chat", "body": "Hello history!"}))
+        
+        # User2 joins
+        async with websockets.connect(user2_url) as user2_ws:
+            # 1. Sync
+            await user2_ws.recv() 
+            # 2. Player Chat History
+            msg = await asyncio.wait_for(recv_json(user2_ws), timeout=5)
+            assert msg["type"] == "player_chat_history"
+            assert any(m["body"] == "Hello history!" for m in msg["messages"])
+
+
+@pytest.mark.asyncio
+async def test_manual_lobby_settings_change(server):
+    http_base_url = server["http"]
+    ws_base_url = server["ws"]
+
+    async with httpx.AsyncClient(base_url=http_base_url) as client:
+        # Create lobby as owner
+        response = await client.post(
+            "/api/create_lobby",
+            json={"user_name": "owner", "lobby_name": "test lobby", "lobby_theme": "rock", "lobby_description": "test"},
+        )
+        owner_cookies = client.cookies
+    lobby_id = response.json()["lobby_id"]
+    lobby_secret = response.json()["lobby_secret"]
+
+    # User 2 joins
+    async with httpx.AsyncClient(base_url=http_base_url) as c:
+        await c.get("/api/ping")
+        user2_cookies = c.cookies
+        
+    owner_url = f"{ws_base_url}/api/join_lobby?lobby_id={lobby_id}&user_name=owner&user_id={owner_cookies['user_id']}&user_secret={owner_cookies['user_secret']}"
+    user2_url = f"{ws_base_url}/api/join_lobby?lobby_id={lobby_id}&user_name=user2&user_id={user2_cookies['user_id']}&user_secret={user2_cookies['user_secret']}"
+
+    async with websockets.connect(owner_url) as owner_ws, websockets.connect(user2_url) as user2_ws:
+        # Consume initial sync messages for both
+        for _ in range(3):
+            await owner_ws.recv()
+            await user2_ws.recv()
+        
+        # 1. Owner updates settings
+        new_settings = {
+            "type": "update_lobby_settings",
+            "lobby_name": "updated name",
+            "theme": "jazz",
+            "description": "updated description",
+            "lobby_secret": lobby_secret
+        }
+        await owner_ws.send(json.dumps(new_settings))
+        
+        # Verify update (owner and user2 receive sync)
+        for ws in [owner_ws, user2_ws]:
+            while True:
+                msg = await asyncio.wait_for(recv_json(ws), timeout=5)
+                if msg["type"] == "lobby_sync" and msg["lobby_name"] == "updated name":
+                    assert msg["theme"] == "jazz"
+                    assert msg["description"] == "updated description"
+                    break
+        
+        # 2. User2 attempts update (unauthorized secret)
+        invalid_settings = {
+            "type": "update_lobby_settings",
+            "lobby_name": "malicious update",
+            "lobby_secret": "wrong_secret"
+        }
+        await user2_ws.send(json.dumps(invalid_settings))
+        
+        # Verify no sync message is received (timeout check)
+        try:
+            # We expect NO lobby_sync message, so waiting should time out
+            await asyncio.wait_for(recv_json(user2_ws), timeout=2)
+            pytest.fail("Unauthorized user should not have received a sync message")
+        except asyncio.TimeoutError:
+            pass # Expected behavior: no message received
 

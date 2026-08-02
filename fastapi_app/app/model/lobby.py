@@ -2,9 +2,15 @@ from typing import Self
 from uuid import uuid4
 from fastapi import HTTPException
 from fastapi.websockets import WebSocketState
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from enum import Enum
 
 from .connected_user import ConnectedUser
+
+class PlayerControllsAccess(str, Enum):
+    AUTHOR_ONLY = "author_only"
+    ALL = "all"
+    WHITELIST = "whitelist"
 
 @dataclass
 class LobbyOwnership:
@@ -26,17 +32,33 @@ class Lobby:
     password: str | None
     users: dict[str, 'ConnectedUser']
     player_history: list[dict]
-    lobby_history: list[dict]
+    current_track_index: int
+    # start_time: float
+    is_shuffled: bool
+    # is_looped: bool
+    # is_paused: bool
+    player_controlls_access: PlayerControllsAccess
+    whitelist: list[str]
+    chat_history: list[dict]
+    ready_users: set[str] = field(default_factory=set)
 
     def __init__(self, user_id: str, user_name: str, lobby_secret: str, lobby_name: str,theme: str, description: str, password: str | None):
         self.author = LobbyOwnership(user_id, user_name, lobby_secret)
         self.lobby_name = lobby_name
         self.users = {}
         self.player_history = []
-        self.lobby_history = []
+        self.current_track_index = -1
+        self.is_shuffled = False
+        # self.start_time = 0.0
+        # self.is_looped = False
+        # self.is_paused = True
+        self.player_controlls_access = PlayerControllsAccess.ALL
+        self.whitelist = []
+        self.chat_history = []
         self.description = description
         self.theme = theme
         self.password = password
+        self.ready_users = set()
     def is_password_protected(self) -> bool:
         return self.password is not '' and self.password is not None
 

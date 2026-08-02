@@ -1,12 +1,22 @@
 import time
+import random
 import asyncio
 import traceback
+import re
 
 from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
 
 from ..model.lobbies import lobbies
-from ..model.lobby import Lobby
+from ..model.lobby import Lobby, PlayerControllsAccess
 from ..model.connected_user import ConnectedUser
+
+YOUTUBE_REGEX = re.compile(r"^.*(youtu.be\/|v\/|u\/\w\/|embed\/|watch\?v=|\&v=)([^#\&\?]*).*")
+
+def get_message_category(body: str) -> str:
+    match = YOUTUBE_REGEX.match(body)
+    if match and len(match.group(2)) == 11:
+        return "youtube_url"
+    return "text_message"
 
 router = APIRouter()
 
@@ -29,13 +39,44 @@ async def broadcast_lobby_sync(lobby: Lobby):
                 "author_id": lobby.author.author_id,
                 "lobby_name": lobby.lobby_name,
                 "theme": lobby.theme,
-                "description": lobby.description
+                "description": lobby.description,
+                "player_controlls_access": lobby.player_controlls_access.value,
+                "whitelist": lobby.whitelist
             }
             # Only send password to the owner
-            if user.socket.cookies.get("user_id") == lobby.author.author_id:
+            if user.socket.cookies.get("user_id") == lobby.author.author_id and lobby.password :
                 data["password"] = lobby.password
             
             await user.socket.send_json(data)
+
+async def broadcast_player_sync(lobby: Lobby):
+    # current_time = time.time(), lobby.start_time
+    for _, user in lobby.users.items():
+        if user.status == "connected":
+            await user.socket.send_json({
+                "type": "player_sync",
+                "current_track_index": lobby.current_track_index,
+                # "current_time": current_time,
+                "is_shuffled": lobby.is_shuffled,
+                # "is_looped": lobby.is_looped,
+                # "is_paused": lobby.is_paused
+                "ready_users": list(lobby.ready_users)
+            })
+
+def is_authorized_for_player_controls(user_id: str, lobby: Lobby) -> bool:
+    # Author always has access
+    if user_id == lobby.author.author_id:
+        return True
+    
+    # Check access level
+    if lobby.player_controlls_access == PlayerControllsAccess.AUTHOR_ONLY:
+        return False
+    
+    if lobby.player_controlls_access == PlayerControllsAccess.WHITELIST:
+        return user_id in lobby.whitelist
+        
+    # Default to ALL (or AUTHOR_ONLY if access is not set for some reason, but we init it to ALL)
+    return lobby.player_controlls_access == PlayerControllsAccess.ALL
 
 @router.websocket("/api/join_lobby")
 async def join_lobby(ws: WebSocket):
@@ -114,7 +155,7 @@ async def join(ws: WebSocket):
             # Send sync and chat history to the reconnected user
             await broadcast_lobby_sync(lobby)
             await ws.send_json({"type": "player_chat_history", "messages": lobby.player_history})
-            await ws.send_json({"type": "lobby_chat_history", "messages": lobby.lobby_history})
+            await ws.send_json({"type": "lobby_chat_history", "messages": lobby.chat_history})
         else:
             await ws.close(code=4009, reason="already connected")
             return
@@ -123,7 +164,7 @@ async def join(ws: WebSocket):
         lobby.users[u_id] = user
         await broadcast_lobby_sync(lobby)
         await ws.send_json({"type": "player_chat_history", "messages": lobby.player_history})
-        await ws.send_json({"type": "lobby_chat_history", "messages": lobby.lobby_history})
+        await ws.send_json({"type": "lobby_chat_history", "messages": lobby.chat_history})
         for other_id, other_user in lobby.users.items():
             if other_id != u_id:
                 try: 
@@ -170,36 +211,44 @@ async def websocket_read_message(user: ConnectedUser):
     # Fallback to query params for testing if not in cookies
     user_id = user.socket.cookies.get("user_id") or user.socket.query_params.get("user_id")
     user_secret = user.socket.cookies.get("user_secret") or user.socket.query_params.get("user_secret")
+    
+    lobby = lobbies.lobbies.get(user.lobby_id)
+    if not lobby:
+        await user.socket.close(code=4004, reason="lobby not found")
+        return
+
     print("read message")
     if mes["type"] in ["player_chat", "lobby_chat"]:
+        
         mes["stamp"] = str(time.time())
         mes["user_name"] = user.user_name
         mes["user_id"] = user_id
-
-        lobby = lobbies.lobbies.get(user.lobby_id)
-        if not lobby:
-            await user.socket.close(code=4004, reason="lobby not found")
-            return
         
         if mes["type"] == "player_chat":
-            lobby.player_history.append(mes)
-        else:
-            lobby.lobby_history.append(mes)
+            # Categorize player_chat
+            mes["category"] = get_message_category(mes.get("body", ""))
             
-        for _, other_user in lobby.users.items():
-            print(f"sending {mes['type']} from {user.user_name} to {other_user.user_name}")
-            await other_user.socket.send_json(mes)
-            print(f"{mes['type']} sent from {user.user_name} to {other_user.user_name}")
+            lobby.player_history.append(mes)
+            await broadcast_player_sync(lobby)
+        else:
+            lobby.chat_history.append(mes)
+            
+        #send mesage to sender for display
+        for _, user in lobby.users.items():
+            print(f"sending {mes['type']} from {user.user_name} to {user.user_name}")
+            await user.socket.send_json(mes)
+            print(f"{mes['type']} sent from {user.user_name} to {user.user_name}")
 
     elif mes["type"] == "test_ping":
         await user.socket.send_json(mes)
+
+    elif mes["type"] == "player_ready":
+        # Handle player_ready message
+        lobby.ready_users.add(user_id)
+        print(f"User {user.user_name} is ready. Total ready: {len(lobby.ready_users)}")
+        await broadcast_player_sync(lobby)
+
     elif mes["type"] == "update_lobby_settings":
-        lobby = lobbies.lobbies.get(user.lobby_id)
-        if not lobby:
-            await user.socket.close(code=4004, reason="lobby not found")
-            return
-        
-        # Correct check: requester must be author AND provide the correct lobby_secret
         provided_secret = mes.get("lobby_secret") 
         
         if user_id == lobby.author.author_id and provided_secret == lobby.author.lobby_secret:
@@ -212,25 +261,81 @@ async def websocket_read_message(user: ConnectedUser):
             if "password" in mes:
                 new_password = mes["password"]
                 lobby.password = new_password if new_password and new_password.strip() else None
+            if "player_controlls_access" in mes:
+                lobby.player_controlls_access = PlayerControllsAccess(mes["player_controlls_access"])
+            if "whitelist" in mes:
+                lobby.whitelist = mes["whitelist"]
             
             await broadcast_lobby_sync(lobby)
 
-    elif mes["type"] == "set_owner":
-        lobby = lobbies.lobbies.get(user.lobby_id)
-        if not lobby:
-            await user.socket.close(code=4004, reason="lobby not found")
+    # elif mes["type"] == "play_pause":
+    #     if not is_authorized_for_player_controls(user_id, lobby):
+    #         return
+    #     lobby.is_paused = not lobby.is_paused
+            
+    #     await broadcast_player_sync(lobby)
+
+    elif mes["type"] == "next_track":
+        if not is_authorized_for_player_controls(user_id, lobby):
             return
+        if len(lobby.player_history) > 0:
+            next_index = (lobby.current_track_index + 1) % len(lobby.player_history)
+            if lobby.is_shuffled:
+                # Random index from next_index to end of list
+                random_index = random.randint(next_index, len(lobby.player_history) - 1)
+                lobby.player_history[next_index], lobby.player_history[random_index] = lobby.player_history[random_index], lobby.player_history[next_index]
+            
+            lobby.current_track_index = next_index
+            lobby.ready_users.clear() # Clear ready status on track change
+            
+            # Broadcast updated history
+            history_message = {"type": "player_chat_history", "messages": lobby.player_history}
+            for _, u in lobby.users.items():
+                if u.status == "connected":
+                    await u.socket.send_json(history_message)
+        await broadcast_player_sync(lobby)
+
+    elif mes["type"] == "prev_track":
+        if not is_authorized_for_player_controls(user_id, lobby):
+            return
+        if len(lobby.player_history) > 0:
+            lobby.current_track_index = (lobby.current_track_index - 1) % len(lobby.player_history)
+            lobby.ready_users.clear() # Clear ready status on track change
+            # lobby.start_time = time.time()
+        await broadcast_player_sync(lobby)
+
+    # elif mes["type"] == "toggle_loop":
+    #     if not is_authorized_for_player_controls(user_id, lobby):
+    #         return
+    #     lobby.is_looped = not lobby.is_looped
+    #     await broadcast_player_sync(lobby)
+
+    elif mes["type"] == "toggle_shuffle":
+        if not is_authorized_for_player_controls(user_id, lobby):
+            return
+        lobby.is_shuffled = not lobby.is_shuffled
+        await broadcast_player_sync(lobby)
+
+    elif mes["type"] == "set_owner":
         
         # Correct check: requester must be author AND provide the correct lobby_secret
         provided_secret = mes.get("lobby_secret")
+        
+        print(f"DEBUG: set_owner request: user={user_id}, author={lobby.author.author_id}, provided_secret={provided_secret}, actual_secret={lobby.author.lobby_secret}")
 
         if user_id == lobby.author.author_id and provided_secret == lobby.author.lobby_secret:
             new_owner_id = mes.get("new_owner_id")
+            print(f"DEBUG: Transferring ownership to {new_owner_id}")
             if new_owner_id in lobby.users:
                 import uuid
                 new_lobby_secret = str(uuid.uuid4())
                 lobby.transfer_ownership(new_owner_id, new_lobby_secret)
+                print(f"DEBUG: Ownership transferred. New author={lobby.author.author_id}")
                 await broadcast_lobby_sync(lobby)
+            else:
+                print(f"DEBUG: new_owner_id {new_owner_id} not in lobby.users")
+        else:
+            print("DEBUG: set_owner authorization failed")
 
 """
 Websocket protocol:

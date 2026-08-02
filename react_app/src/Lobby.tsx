@@ -12,12 +12,96 @@ import RepeatIcon from "./components/icons/RepeatIcon";
 import ShuffleIcon from "./components/icons/ShuffleIcon";
 import SpinnerIcon from "./components/icons/SpinnerIcon";
 
+function getYoutubeId(url: string): string | null {
+  const regExp = /^.*(youtu.be\/|v\/|u\/\w\/|embed\/|watch\?v=|\&v=)([^#\&\?]*).*/;
+  const match = url.match(regExp);
+  return (match && match[2].length === 11) ? match[2] : null;
+}
+
+function YoutubeEmbed({ videoId, index, currentTrackIndex, ws }: { videoId: string; index: number; currentTrackIndex: number; ws: React.MutableRefObject<WebSocket | null> }) {
+  const playerRef = useRef<any>(null);
+  const divRef = useRef<HTMLDivElement>(null);
+  const hasPausedRef = useRef(false);
+
+  const isCurrentTrack = index === currentTrackIndex;
+  const isCurrentTrackRef = useRef(isCurrentTrack);
+  isCurrentTrackRef.current = isCurrentTrack;
+
+  useEffect(() => {
+    // Load script if not loaded
+    if (!(window as any).YT) {
+      const tag = document.createElement('script');
+      tag.src = "https://www.youtube.com/iframe_api";
+      document.body.appendChild(tag);
+    }
+
+    const initPlayer = () => {
+      if ((window as any).YT && (window as any).YT.Player) {
+        playerRef.current = new (window as any).YT.Player(divRef.current, {
+          videoId: videoId,
+          playerVars: { autoplay: 0, mute: 1, wmode: 'transparent' },
+          events: {
+            onReady: (event: any) => {
+              if (isCurrentTrackRef.current) {
+                event.target.playVideo();
+              }
+            },
+            onStateChange: (event: any) => {
+              console.log(event.data);
+              if (event.data === (window as any).YT.PlayerState.PLAYING
+                && !hasPausedRef.current && isCurrentTrackRef.current) {
+                event.target.pauseVideo();
+                hasPausedRef.current = true;
+                if (ws.current?.readyState === WebSocket.OPEN) {
+                  ws.current.send(JSON.stringify({ type: "player_ready" }));
+                  console.log(`Sent player_ready.`);
+                }
+              }
+            }
+          }
+        });
+      }
+    };
+
+    if ((window as any).YT && (window as any).YT.Player) {
+      initPlayer();
+    } else {
+      (window as any).onYouTubeIframeAPIReady = initPlayer;
+    }
+
+    return () => {
+      if (playerRef.current) {
+        playerRef.current.destroy();
+      }
+    };
+  }, [videoId]);
+
+  return (
+    <div className="w-full relative">
+      <div ref={divRef} className="aspect-video w-full rounded-lg [&>iframe]:w-full [&>iframe]:h-full" />
+      {isCurrentTrack && (
+        <div className="absolute inset-0 bg-[#101010]/50 rounded-lg flex items-center justify-center z-50">
+          <span className="text-white text-lg font-semibold">Users Ready:</span>
+        </div>
+      )}
+      <button
+        onClick={() => playerRef.current?.playVideo()}
+        className="mt-2 text-xs bg-white/20 text-white p-1 rounded absolute hover:bg-white/30 z-9999"
+      >
+        Debug Play
+      </button>
+    </div>
+  );
+}
+
 export default function LobbyPage() {
   const location = useLocation();
   const navigate = useNavigate();
   const lobbyId = location.search.substring(1);
   const myNickname = localStorage.getItem('oscillator_nickname');
   const ws = useRef<WebSocket | null>(null);
+
+
   const [playerMessages, setPlayerMessages] = useState<any[]>([]);
   const [chatMessages, setChatMessages] = useState<any[]>([]);
   const [users, setUsers] = useState<any[]>([]);
@@ -40,7 +124,8 @@ export default function LobbyPage() {
   const [isPlaying, setIsPlaying] = useState(false);
   const [isLooping, setIsLooping] = useState(false);
   const [isShuffling, setIsShuffling] = useState(false);
-  
+  const [currentTrackIndex, setCurrentTrackIndex] = useState(0);
+
   const [musicControlsLocked, setMusicControlsLocked] = useState(false);
 
   const getButtonClasses = (isToggled: boolean, isLocked: boolean) => {
@@ -229,6 +314,14 @@ export default function LobbyPage() {
     return time;
   };
 
+  const renderPlayerMessageBody = (body: string, index: number) => {
+    const youtubeId = getYoutubeId(body);
+    if (youtubeId) {
+      return <YoutubeEmbed videoId={youtubeId} index={index} currentTrackIndex={currentTrackIndex} ws={ws} />;
+    }
+    return body;
+  };
+
   return (
     <div className="min-h-screen text-white p-20 relative">
       <div className="absolute inset-0 -z-10 overflow-hidden">
@@ -250,9 +343,10 @@ export default function LobbyPage() {
               <div className="absolute inset-0 overflow-y-auto overflow-x-hidden border-b-2 border-white/70 scrollbar-thin scrollbar-thumb-white/20 scrollbar-track-transparent" ref={playerChatRef} onScroll={handlePlayerScroll}>
                 {playerMessages.map((m, i) => {
                   const isMine = m.user_name === myNickname;
+                  const youtubeId = getYoutubeId(m.body);
                   return (
                     <div key={i} className={`flex ${isMine ? 'justify-end' : 'justify-start'} p-2`}>
-                      <div className="border border-white/70 rounded-2xl p-3 max-w-[80%]">
+                      <div className={`border border-white/70 rounded-2xl p-3 ${youtubeId ? 'w-[95%]' : 'max-w-[80%]'}`}>
                         <div className={`flex items-baseline gap-2 ${isMine ? 'justify-end' : 'justify-start'}`}>
                           {isMine && m.stamp && (
                             <span className="text-xs text-white/50">
@@ -266,7 +360,7 @@ export default function LobbyPage() {
                             </span>
                           )}
                         </div>
-                        <div className={isMine ? 'text-right' : 'text-left'}>{m.body}</div>
+                        <div className={isMine ? 'text-right' : 'text-left'}>{renderPlayerMessageBody(m.body, i)}</div>
                       </div>
                     </div>
                   );
@@ -278,34 +372,41 @@ export default function LobbyPage() {
             </div>
             <div className="flex flex-col gap-2 pt-2 pb-2">
               <div className="flex items-center justify-center gap-6 text-white/50 pb-2 border-b-2 border-white/70 w-full px-2">
-                <button 
-                    onClick={() => setIsShuffling(!isShuffling)} 
-                    disabled={musicControlsLocked}
-                    className={getButtonClasses(isShuffling, musicControlsLocked)}
-                >
-                    <ShuffleIcon className="w-6 h-6" />
-                </button>
+                {
+                  // <button
+                  //   onClick={() => setIsLooping(!isLooping)}
+                  //   disabled={musicControlsLocked}
+                  //   className={getButtonClasses(isLooping, musicControlsLocked)}
+                  // >
+                  //   <RepeatIcon className="w-6 h-6" />
+                  // </button>
+                }
+
                 <button disabled={musicControlsLocked} className={getButtonClasses(false, musicControlsLocked)}>
-                    <SkipBackIcon className="w-6 h-6" />
+                  <SkipBackIcon className="w-6 h-6" />
                 </button>
-                <button 
-                    onClick={() => setIsPlaying(!isPlaying)} 
-                    disabled={musicControlsLocked}
-                    className={getButtonClasses(isPlaying, musicControlsLocked)}
-                >
-                    {isPlaying ? <PauseIcon className="w-6 h-6" /> : <PlayIcon className="w-6 h-6" />}
-                </button>
+                {
+                  //   <button 
+                  //     onClick={() => setIsPlaying(!isPlaying)} 
+                  //     disabled={musicControlsLocked}
+                  //     className={getButtonClasses(isPlaying, musicControlsLocked)}
+                  // >
+                  //     {isPlaying ? <PauseIcon className="w-6 h-6" /> : <PlayIcon className="w-6 h-6" />}
+                  // </button>
+                }
                 <button disabled={musicControlsLocked} className={getButtonClasses(false, musicControlsLocked)}>
-                    <SkipForwardIcon className="w-6 h-6" />
+                  <SkipForwardIcon className="w-6 h-6" />
                 </button>
-                <button 
-                    onClick={() => setIsLooping(!isLooping)} 
-                    disabled={musicControlsLocked}
-                    className={getButtonClasses(isLooping, musicControlsLocked)}
+
+                <button
+                  onClick={() => setIsShuffling(!isShuffling)}
+                  disabled={musicControlsLocked}
+                  className={getButtonClasses(isShuffling, musicControlsLocked)}
                 >
-                    <RepeatIcon className="w-6 h-6" />
+                  <ShuffleIcon className="w-6 h-6" />
                 </button>
               </div>
+
               <div className="flex gap-2">
                 <input
                   type="text"
@@ -413,131 +514,138 @@ export default function LobbyPage() {
             </div>
           </div>
         </div>
-      )}
-      {selectedUser && (
-        <div className="fixed inset-0 z-50" onClick={() => setSelectedUser(null)}>
-          <div
-            className="absolute bg-[#101010] border border-white/70 rounded-xl p-2 w-fit min-w-[120px] flex flex-col items-center"
-            style={{ top: selectedUser.y, left: selectedUser.x }}
-            onClick={e => e.stopPropagation()}
-          >
-            {selectedUser.user.user_name === myNickname ? (
-              <button onClick={() => {
-                setEditingNickname(true);
-                setNewNickname(myNickname || "");
-                setSelectedUser(null);
-              }} className="w-full text-center p-2 hover:bg-white/10 rounded whitespace-nowrap">Change Nickname</button>
-            ) : (
-              <>
-                <button onClick={() => { console.log('Kick', selectedUser.user); setSelectedUser(null); }} className="w-full text-center p-2 hover:bg-white/10 rounded">Kick</button>
-                <button onClick={() => { console.log('Ban', selectedUser.user); setSelectedUser(null); }} className="w-full text-center p-2 hover:bg-white/10 rounded">Ban</button>
+      )
+      }
+      {
+        selectedUser && (
+          <div className="fixed inset-0 z-50" onClick={() => setSelectedUser(null)}>
+            <div
+              className="absolute bg-[#101010] border border-white/70 rounded-xl p-2 w-fit min-w-[120px] flex flex-col items-center"
+              style={{ top: selectedUser.y, left: selectedUser.x }}
+              onClick={e => e.stopPropagation()}
+            >
+              {selectedUser.user.user_name === myNickname ? (
                 <button onClick={() => {
-                  ws.current?.send(JSON.stringify({
-                    type: 'set_owner',
-                    new_owner_id: selectedUser.user.user_id,
-                    lobby_secret: localStorage.getItem('lobby_secret')
-                  }));
+                  setEditingNickname(true);
+                  setNewNickname(myNickname || "");
                   setSelectedUser(null);
-                }} className="w-full text-center p-2 hover:bg-white/10 rounded">Make Owner</button>
-              </>
-            )}
-          </div>
-        </div>
-      )}
-      {showSettings && (
-        <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/50"
-          onMouseDown={(e) => {
-            if (e.target === e.currentTarget) {
-              setClickStartedOnOverlay(true);
-            }
-          }}
-          onMouseUp={(e) => {
-            if (clickStartedOnOverlay && e.target === e.currentTarget) {
-              saveSettings();
-            }
-            setClickStartedOnOverlay(false);
-          }}
-        >
-          <div
-            className="bg-[#101010] border-2 border-white/70 rounded-3xl p-8 w-80"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <h2 className="text-2xl text-white mb-6">Settings</h2>
-            <input type="text" value={lobbyName} onChange={e => setLobbyName(e.target.value)} placeholder="Lobby Name" className="w-full bg-transparent border border-white/20 p-2 mb-2 rounded text-white" />
-            <input type="text" value={theme} onChange={e => setTheme(e.target.value)} placeholder="Theme" className="w-full bg-transparent border border-white/20 p-2 mb-2 rounded text-white" />
-            <input type="text" value={description} onChange={e => setDescription(e.target.value)} placeholder="Description" className="w-full bg-transparent border border-white/20 p-2 mb-2 rounded text-white" />
-            <div className="relative mb-4">
-              <input type={showPassword ? "text" : "password"} value={password} onChange={e => setPassword(e.target.value)} placeholder="Password (leave blank for none)" className="w-full bg-transparent border border-white/20 p-2 rounded text-white" />
-              <button
-                type="button"
-                onClick={() => setShowPassword(!showPassword)}
-                className="absolute right-3 top-1/2 -translate-y-1/2 text-white/50 hover:text-white"
-              >
-                <EyeIcon className="w-5 h-5" />
-              </button>
-            </div>
-
-            <button
-              onClick={deleteLobby}
-              className="w-full text-red-500 hover:text-red-400 text-sm border border-red-500/50 rounded-lg px-3 py-2 mb-4"
-            >
-              Delete Lobby
-            </button>
-            <button
-              onClick={saveSettings}
-              className="w-full text-white/50 hover:text-white text-sm border border-white/20 rounded-lg px-3 py-2"
-            >
-              Save & Close
-            </button>
-          </div>
-        </div>
-      )}
-      {passwordRequired && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-4">
-          <div className="bg-[#101010] border-2 border-white/70 rounded-3xl p-8 w-80 h-[240px] flex flex-col justify-between" onClick={(e) => e.stopPropagation()}>
-            <h2 className="text-2xl text-white text-center">Password Required</h2>
-            <div className="flex-grow flex items-center justify-center my-2">
-              {authError && (
-                <p className="text-red-500 text-sm text-center break-all">{authError}</p>
+                }} className="w-full text-center p-2 hover:bg-white/10 rounded whitespace-nowrap">Change Nickname</button>
+              ) : (
+                <>
+                  <button onClick={() => { console.log('Kick', selectedUser.user); setSelectedUser(null); }} className="w-full text-center p-2 hover:bg-white/10 rounded">Kick</button>
+                  <button onClick={() => { console.log('Ban', selectedUser.user); setSelectedUser(null); }} className="w-full text-center p-2 hover:bg-white/10 rounded">Ban</button>
+                  <button onClick={() => {
+                    ws.current?.send(JSON.stringify({
+                      type: 'set_owner',
+                      new_owner_id: selectedUser.user.user_id,
+                      lobby_secret: localStorage.getItem('lobby_secret')
+                    }));
+                    setSelectedUser(null);
+                  }} className="w-full text-center p-2 hover:bg-white/10 rounded">Make Owner</button>
+                </>
               )}
             </div>
-            <div>
+          </div>
+        )
+      }
+      {
+        showSettings && (
+          <div
+            className="fixed inset-0 z-50 flex items-center justify-center bg-black/50"
+            onMouseDown={(e) => {
+              if (e.target === e.currentTarget) {
+                setClickStartedOnOverlay(true);
+              }
+            }}
+            onMouseUp={(e) => {
+              if (clickStartedOnOverlay && e.target === e.currentTarget) {
+                saveSettings();
+              }
+              setClickStartedOnOverlay(false);
+            }}
+          >
+            <div
+              className="bg-[#101010] border-2 border-white/70 rounded-3xl p-8 w-80"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <h2 className="text-2xl text-white mb-6">Settings</h2>
+              <input type="text" value={lobbyName} onChange={e => setLobbyName(e.target.value)} placeholder="Lobby Name" className="w-full bg-transparent border border-white/20 p-2 mb-2 rounded text-white" />
+              <input type="text" value={theme} onChange={e => setTheme(e.target.value)} placeholder="Theme" className="w-full bg-transparent border border-white/20 p-2 mb-2 rounded text-white" />
+              <input type="text" value={description} onChange={e => setDescription(e.target.value)} placeholder="Description" className="w-full bg-transparent border border-white/20 p-2 mb-2 rounded text-white" />
               <div className="relative mb-4">
-                <input
-                  type={showJoinPassword ? "text" : "password"}
-                  value={passwordInput}
-                  onChange={e => setPasswordInput(e.target.value)}
-                  onKeyDown={(e) => e.key === 'Enter' && submitPassword()}
-                  placeholder="Enter Password"
-                  className="w-full bg-transparent border border-white/20 p-2 rounded text-white"
-                />
+                <input type={showPassword ? "text" : "password"} value={password} onChange={e => setPassword(e.target.value)} placeholder="Password (leave blank for none)" className="w-full bg-transparent border border-white/20 p-2 rounded text-white" />
                 <button
                   type="button"
-                  onClick={() => setShowJoinPassword(!showJoinPassword)}
+                  onClick={() => setShowPassword(!showPassword)}
                   className="absolute right-3 top-1/2 -translate-y-1/2 text-white/50 hover:text-white"
                 >
                   <EyeIcon className="w-5 h-5" />
                 </button>
               </div>
-              <div className="flex gap-2">
-                <button
-                  onClick={() => navigate("/lobby_list")}
-                  className="flex-1 text-white hover:text-white/80 border border-white/20 rounded-lg px-3 py-2"
-                >
-                  Go Back
-                </button>
-                <button
-                  onClick={submitPassword}
-                  className="flex-1 text-white hover:text-white/80 border border-white/20 rounded-lg px-3 py-2"
-                >
-                  Join Lobby
-                </button>
+
+              <button
+                onClick={deleteLobby}
+                className="w-full text-red-500 hover:text-red-400 text-sm border border-red-500/50 rounded-lg px-3 py-2 mb-4"
+              >
+                Delete Lobby
+              </button>
+              <button
+                onClick={saveSettings}
+                className="w-full text-white/50 hover:text-white text-sm border border-white/20 rounded-lg px-3 py-2"
+              >
+                Save & Close
+              </button>
+            </div>
+          </div>
+        )
+      }
+      {
+        passwordRequired && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-4">
+            <div className="bg-[#101010] border-2 border-white/70 rounded-3xl p-8 w-80 h-[240px] flex flex-col justify-between" onClick={(e) => e.stopPropagation()}>
+              <h2 className="text-2xl text-white text-center">Password Required</h2>
+              <div className="flex-grow flex items-center justify-center my-2">
+                {authError && (
+                  <p className="text-red-500 text-sm text-center break-all">{authError}</p>
+                )}
+              </div>
+              <div>
+                <div className="relative mb-4">
+                  <input
+                    type={showJoinPassword ? "text" : "password"}
+                    value={passwordInput}
+                    onChange={e => setPasswordInput(e.target.value)}
+                    onKeyDown={(e) => e.key === 'Enter' && submitPassword()}
+                    placeholder="Enter Password"
+                    className="w-full bg-transparent border border-white/20 p-2 rounded text-white"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowJoinPassword(!showJoinPassword)}
+                    className="absolute right-3 top-1/2 -translate-y-1/2 text-white/50 hover:text-white"
+                  >
+                    <EyeIcon className="w-5 h-5" />
+                  </button>
+                </div>
+                <div className="flex gap-2">
+                  <button
+                    onClick={() => navigate("/lobby_list")}
+                    className="flex-1 text-white hover:text-white/80 border border-white/20 rounded-lg px-3 py-2"
+                  >
+                    Go Back
+                  </button>
+                  <button
+                    onClick={submitPassword}
+                    className="flex-1 text-white hover:text-white/80 border border-white/20 rounded-lg px-3 py-2"
+                  >
+                    Join Lobby
+                  </button>
+                </div>
               </div>
             </div>
           </div>
-        </div>
-      )}
-    </div>
+        )
+      }
+    </div >
   );
 }

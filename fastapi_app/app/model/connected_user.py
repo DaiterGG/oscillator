@@ -15,6 +15,7 @@ class ConnectedUser:
     status: str = "connected"
     reconnect_task: Optional[asyncio.Task] = None
     join_time: float = dataclasses.field(default_factory=time.time)
+    autoplay: bool = True
 
     def validate_user_state(self, state: State):
         server_side = self.socket.cookies["user_secret"]

@@ -4,11 +4,8 @@ import SendIcon from "./components/icons/SendIcon";
 import CogIcon from "./components/icons/CogIcon";
 import CrownIcon from "./components/icons/CrownIcon";
 import EyeIcon from "./components/icons/EyeIcon";
-import PlayIcon from "./components/icons/PlayIcon";
-import PauseIcon from "./components/icons/PauseIcon";
 import SkipBackIcon from "./components/icons/SkipBackIcon";
 import SkipForwardIcon from "./components/icons/SkipForwardIcon";
-import RepeatIcon from "./components/icons/RepeatIcon";
 import ShuffleIcon from "./components/icons/ShuffleIcon";
 import SpinnerIcon from "./components/icons/SpinnerIcon";
 
@@ -18,14 +15,29 @@ function getYoutubeId(url: string): string | null {
   return (match && match[2].length === 11) ? match[2] : null;
 }
 
-function YoutubeEmbed({ videoId, index, currentTrackIndex, ws }: { videoId: string; index: number; currentTrackIndex: number; ws: React.MutableRefObject<WebSocket | null> }) {
+function YoutubeEmbed({ videoId, index, currentTrackIndex, ws, readyUserIds, allUsers, myNickname }: { videoId: string; index: number; currentTrackIndex: number; ws: React.MutableRefObject<WebSocket | null>; readyUserIds: string[]; allUsers: any[]; myNickname: string | null }) {
   const playerRef = useRef<any>(null);
   const divRef = useRef<HTMLDivElement>(null);
   const hasPausedRef = useRef(false);
+  const playRetryInterval = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const isCurrentTrack = index === currentTrackIndex;
   const isCurrentTrackRef = useRef(isCurrentTrack);
   isCurrentTrackRef.current = isCurrentTrack;
+
+  const allConnectedUserIds = allUsers.filter(u => u.status === 'connected').map(u => u.user_id);
+  const allReady = allConnectedUserIds.every(uid => readyUserIds.includes(uid));
+
+  useEffect(() => {
+    // Reset pause ref when video or track status changes
+    hasPausedRef.current = false;
+  }, [videoId, isCurrentTrack]);
+
+  useEffect(() => {
+    if (isCurrentTrack && allReady && playerRef.current && hasPausedRef.current) {
+      playerRef.current.playVideo();
+    }
+  }, [isCurrentTrack, allReady]);
 
   useEffect(() => {
     // Load script if not loaded
@@ -39,22 +51,36 @@ function YoutubeEmbed({ videoId, index, currentTrackIndex, ws }: { videoId: stri
       if ((window as any).YT && (window as any).YT.Player) {
         playerRef.current = new (window as any).YT.Player(divRef.current, {
           videoId: videoId,
-          playerVars: { autoplay: 0, mute: 1, wmode: 'transparent' },
+          playerVars: { autoplay: 0, mute: 1, wmode: 'transparent' }, // Set autoplay to 0
           events: {
-            onReady: (event: any) => {
+            onReady: () => {
               if (isCurrentTrackRef.current) {
-                event.target.playVideo();
+                console.log("on ready start retry loop")
+                if (playRetryInterval.current) clearInterval(playRetryInterval.current);
+                playRetryInterval.current = setInterval(() => {
+                  if (playerRef.current && typeof playerRef.current.playVideo === 'function') {
+                    console.log("Retry play")
+                    playerRef.current.playVideo();
+                  }
+                }, 500);
               }
             },
             onStateChange: (event: any) => {
-              console.log(event.data);
+              console.log("State Change:", event.data)
+
+              // If it's playing and we haven't paused it yet, pause it and mark ready
               if (event.data === (window as any).YT.PlayerState.PLAYING
                 && !hasPausedRef.current && isCurrentTrackRef.current) {
+
+                console.log("pause after play")
+                if (playRetryInterval.current) clearInterval(playRetryInterval.current);
+
                 event.target.pauseVideo();
+                event.target.seekTo(0);
+                event.target.unMute();
                 hasPausedRef.current = true;
                 if (ws.current?.readyState === WebSocket.OPEN) {
                   ws.current.send(JSON.stringify({ type: "player_ready" }));
-                  console.log(`Sent player_ready.`);
                 }
               }
             }
@@ -70,18 +96,24 @@ function YoutubeEmbed({ videoId, index, currentTrackIndex, ws }: { videoId: stri
     }
 
     return () => {
+      if (playRetryInterval.current) clearInterval(playRetryInterval.current);
       if (playerRef.current) {
         playerRef.current.destroy();
       }
     };
   }, [videoId]);
 
+  const readyUserNames = allUsers.filter(u => readyUserIds.includes(u.user_id)).map(u => u.user_name === myNickname ? "you" : u.user_name);
+  const notReadyUserNames = allUsers.filter(u => u.status === 'connected' && !readyUserIds.includes(u.user_id)).map(u => u.user_name === myNickname ? "you" : u.user_name);
+
   return (
     <div className="w-full relative">
       <div ref={divRef} className="aspect-video w-full rounded-lg [&>iframe]:w-full [&>iframe]:h-full" />
-      {isCurrentTrack && (
-        <div className="absolute inset-0 bg-[#101010]/50 rounded-lg flex items-center justify-center z-50">
-          <span className="text-white text-lg font-semibold">Users Ready:</span>
+      {isCurrentTrack && !allReady && (
+        <div className="absolute inset-0 bg-[#101010]/20 backdrop-blur-sm rounded-lg flex flex-col items-center justify-center z-50">
+          <span className="text-white text-lg font-semibold mb-2">Waiting for users...</span>
+          <div className="text-sm text-green-400">Ready: {readyUserNames.join(', ')}</div>
+          <div className="text-sm text-red-400">Waiting for: {notReadyUserNames.join(', ')}</div>
         </div>
       )}
       <button
@@ -121,12 +153,11 @@ export default function LobbyPage() {
   const [newNickname, setNewNickname] = useState("");
 
   // Music Player States
-  const [isPlaying, setIsPlaying] = useState(false);
-  const [isLooping, setIsLooping] = useState(false);
   const [isShuffling, setIsShuffling] = useState(false);
   const [currentTrackIndex, setCurrentTrackIndex] = useState(0);
+  const [readyUserIds, setReadyUserIds] = useState<string[]>([]);
 
-  const [musicControlsLocked, setMusicControlsLocked] = useState(false);
+  const [musicControlsLocked, _setMusicControlsLocked] = useState(false);
 
   const getButtonClasses = (isToggled: boolean, isLocked: boolean) => {
     if (isLocked) return "text-white/20 cursor-not-allowed";
@@ -160,15 +191,8 @@ export default function LobbyPage() {
 
   const playerChatRef = useRef<HTMLDivElement>(null);
   const lobbyChatRef = useRef<HTMLDivElement>(null);
-  const [showPlayerScrollDown, setShowPlayerScrollDown] = useState(false);
   const [showLobbyScrollDown, setShowLobbyScrollDown] = useState(false);
-
-  const handlePlayerScroll = () => {
-    if (playerChatRef.current) {
-      const { scrollTop, scrollHeight, clientHeight } = playerChatRef.current;
-      setShowPlayerScrollDown(scrollHeight - scrollTop > clientHeight + 100);
-    }
-  };
+  const [isCurrentTrackVisible, setIsCurrentTrackVisible] = useState(true);
 
   const handleLobbyScroll = () => {
     if (lobbyChatRef.current) {
@@ -177,22 +201,37 @@ export default function LobbyPage() {
     }
   };
 
-  const scrollToBottomPlayer = () => {
-    playerChatRef.current?.scrollTo({ top: playerChatRef.current.scrollHeight, behavior: 'smooth' });
+  const handlePlayerScroll = () => {
+    if (playerChatRef.current) {
+      const currentTrackElement = playerChatRef.current.querySelector('[data-is-current="true"]');
+      if (currentTrackElement) {
+        const rect = currentTrackElement.getBoundingClientRect();
+        const containerRect = playerChatRef.current.getBoundingClientRect();
+        const isVisible = rect.top >= containerRect.top && rect.bottom <= containerRect.bottom;
+        setIsCurrentTrackVisible(isVisible);
+      }
+    }
   };
 
   const scrollToBottomLobby = () => {
     lobbyChatRef.current?.scrollTo({ top: lobbyChatRef.current.scrollHeight, behavior: 'smooth' });
   };
 
-  useEffect(() => {
-    if (playerChatRef.current && !showPlayerScrollDown) {
-      playerChatRef.current.scrollTop = playerChatRef.current.scrollHeight;
+  const scrollToCurrentTrack = () => {
+    if (playerChatRef.current) {
+      const currentTrackElement = playerChatRef.current.querySelector('[data-is-current="true"]');
+      if (currentTrackElement) {
+        currentTrackElement.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      }
     }
+  };
+
+  useEffect(() => {
     if (lobbyChatRef.current && !showLobbyScrollDown) {
       lobbyChatRef.current.scrollTop = lobbyChatRef.current.scrollHeight;
     }
-  }, [playerMessages, chatMessages]);
+    handlePlayerScroll();
+  }, [playerMessages, chatMessages, currentTrackIndex]);
 
   const [passwordRequired, setPasswordRequired] = useState(false);
   const [passwordInput, setPasswordInput] = useState("");
@@ -248,6 +287,10 @@ export default function LobbyPage() {
           if (data.password !== undefined) {
             setPassword(data.password);
           }
+        } else if (data.type === 'player_sync') {
+          setCurrentTrackIndex(data.current_track_index);
+          setIsShuffling(data.is_shuffled);
+          setReadyUserIds(data.ready_users || []);
         } else if (data.type === 'user_joined') {
           setUsers((prev) => {
             if (prev.some(u => u.user_id === data.user_id)) return prev;
@@ -317,7 +360,17 @@ export default function LobbyPage() {
   const renderPlayerMessageBody = (body: string, index: number) => {
     const youtubeId = getYoutubeId(body);
     if (youtubeId) {
-      return <YoutubeEmbed videoId={youtubeId} index={index} currentTrackIndex={currentTrackIndex} ws={ws} />;
+      return (
+        <YoutubeEmbed
+          videoId={youtubeId}
+          index={index}
+          currentTrackIndex={currentTrackIndex}
+          ws={ws}
+          readyUserIds={readyUserIds}
+          allUsers={users}
+          myNickname={myNickname}
+        />
+      );
     }
     return body;
   };
@@ -344,30 +397,40 @@ export default function LobbyPage() {
                 {playerMessages.map((m, i) => {
                   const isMine = m.user_name === myNickname;
                   const youtubeId = getYoutubeId(m.body);
+                  const showHistoryLabel = i === 0 && i < currentTrackIndex;
+                  const showCurrentTrackLabel = i === currentTrackIndex;
+
                   return (
-                    <div key={i} className={`flex ${isMine ? 'justify-end' : 'justify-start'} p-2`}>
-                      <div className={`border border-white/70 rounded-2xl p-3 ${youtubeId ? 'w-[95%]' : 'max-w-[80%]'}`}>
-                        <div className={`flex items-baseline gap-2 ${isMine ? 'justify-end' : 'justify-start'}`}>
-                          {isMine && m.stamp && (
-                            <span className="text-xs text-white/50">
-                              {formatTime(m.stamp)}
-                            </span>
-                          )}
-                          <span className="text text-white/70">{m.user_name}</span>
-                          {!isMine && m.stamp && (
-                            <span className="text-xs text-white/50">
-                              {formatTime(m.stamp)}
-                            </span>
-                          )}
+                    <div key={m.stamp || i} className={`flex flex-col ${isMine ? 'justify-end' : 'justify-start'} p-0`} data-is-current={i === currentTrackIndex ? "true" : undefined}>
+                      {showHistoryLabel && <div className="text-white/50 text-xs pl-4 pt-2">History</div>}
+                      <div className={`w-full ${i === currentTrackIndex ? 'bg-white/10 border-t border-b border-white/20' : ''}`}>
+                        {showCurrentTrackLabel && <div className="text-white/50 text-xs pl-4 pt-1">Current Track</div>}
+                        <div className={`flex ${isMine ? 'justify-end' : 'justify-start'} p-2`}>
+                          <div className={`border border-white/70 rounded-2xl p-3 bg-[#101010] ${youtubeId ? 'w-[95%]' : 'max-w-[80%]'}`}>
+                            <div className={`flex items-baseline gap-2 ${isMine ? 'justify-end' : 'justify-start'}`}>
+                              {isMine && m.stamp && (
+                                <span className="text-xs text-white/50">
+                                  {formatTime(m.stamp)}
+                                </span>
+                              )}
+                              <span className="text text-white/70">{m.user_name}</span>
+                              {!isMine && m.stamp && (
+                                <span className="text-xs text-white/50">
+                                  {formatTime(m.stamp)}
+                                </span>
+                              )}
+                            </div>
+                            <div className={isMine ? 'text-right' : 'text-left'}>{renderPlayerMessageBody(m.body, i)}</div>
+                          </div>
                         </div>
-                        <div className={isMine ? 'text-right' : 'text-left'}>{renderPlayerMessageBody(m.body, i)}</div>
                       </div>
+                      {showCurrentTrackLabel && currentTrackIndex < playerMessages.length - 1 && <div className="text-white/50 text-xs pl-4 pt-1 pb-1">Queue</div>}
                     </div>
                   );
                 })}
               </div>
-              {showPlayerScrollDown && (
-                <button onClick={scrollToBottomPlayer} className="absolute bottom-4 left-1/2 -translate-x-1/2 border border-white text-white rounded-full p-2 text-xs">Scroll Down</button>
+              {!isCurrentTrackVisible && (
+                <button onClick={scrollToCurrentTrack} className="absolute bottom-4 left-1/2 -translate-x-1/2 border border-white text-white rounded-full p-2 text-xs bg-[#101010]/80">Current Track</button>
               )}
             </div>
             <div className="flex flex-col gap-2 pt-2 pb-2">
@@ -382,7 +445,15 @@ export default function LobbyPage() {
                   // </button>
                 }
 
-                <button disabled={musicControlsLocked} className={getButtonClasses(false, musicControlsLocked)}>
+                <button
+                  onClick={() => {
+                    if (ws.current?.readyState === WebSocket.OPEN) {
+                      ws.current.send(JSON.stringify({ type: "prev_track" }));
+                    }
+                  }}
+                  disabled={musicControlsLocked}
+                  className={getButtonClasses(false, musicControlsLocked)}
+                >
                   <SkipBackIcon className="w-6 h-6" />
                 </button>
                 {
@@ -394,12 +465,24 @@ export default function LobbyPage() {
                   //     {isPlaying ? <PauseIcon className="w-6 h-6" /> : <PlayIcon className="w-6 h-6" />}
                   // </button>
                 }
-                <button disabled={musicControlsLocked} className={getButtonClasses(false, musicControlsLocked)}>
+                <button
+                  onClick={() => {
+                    if (ws.current?.readyState === WebSocket.OPEN) {
+                      ws.current.send(JSON.stringify({ type: "next_track" }));
+                    }
+                  }}
+                  disabled={musicControlsLocked}
+                  className={getButtonClasses(false, musicControlsLocked)}
+                >
                   <SkipForwardIcon className="w-6 h-6" />
                 </button>
 
                 <button
-                  onClick={() => setIsShuffling(!isShuffling)}
+                  onClick={() => {
+                    if (ws.current?.readyState === WebSocket.OPEN) {
+                      ws.current?.send(JSON.stringify({ type: "toggle_shuffle" }));
+                    }
+                  }}
                   disabled={musicControlsLocked}
                   className={getButtonClasses(isShuffling, musicControlsLocked)}
                 >
@@ -468,7 +551,7 @@ export default function LobbyPage() {
           </div>
           <div className="col-span-1 border-2 border-white/70 rounded-3xl p-6 bg-[#101010]/80">
             <div className="flex justify-between items-center mb-4">
-              <h2 className="text-xl text-white/50 font-light">Users</h2>
+              <h2 className="text-2xl text-white/50 font-light">Users</h2>
               <button onClick={() => setShowSettings(!showSettings)} className="text-white/50 hover:text-white">
                 <CogIcon className="w-6 h-6" />
               </button>

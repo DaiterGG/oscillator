@@ -229,6 +229,13 @@ async def websocket_read_message(user: ConnectedUser):
             mes["category"] = get_message_category(mes.get("body", ""))
             
             lobby.player_history.append(mes)
+            # If this is the first track, initialize index
+            if lobby.current_track_index == -1:
+                lobby.current_track_index = 0
+            
+            # Reset ready state for a new track
+            lobby.ready_users.clear()
+            
             await broadcast_player_sync(lobby)
         else:
             lobby.chat_history.append(mes)
@@ -278,8 +285,8 @@ async def websocket_read_message(user: ConnectedUser):
     elif mes["type"] == "next_track":
         if not is_authorized_for_player_controls(user_id, lobby):
             return
-        if len(lobby.player_history) > 0:
-            next_index = (lobby.current_track_index + 1) % len(lobby.player_history)
+        if len(lobby.player_history) > 0 and lobby.current_track_index < len(lobby.player_history) - 1:
+            next_index = lobby.current_track_index + 1
             if lobby.is_shuffled:
                 # Random index from next_index to end of list
                 random_index = random.randint(next_index, len(lobby.player_history) - 1)
@@ -298,8 +305,8 @@ async def websocket_read_message(user: ConnectedUser):
     elif mes["type"] == "prev_track":
         if not is_authorized_for_player_controls(user_id, lobby):
             return
-        if len(lobby.player_history) > 0:
-            lobby.current_track_index = (lobby.current_track_index - 1) % len(lobby.player_history)
+        if len(lobby.player_history) > 0 and lobby.current_track_index > 0:
+            lobby.current_track_index = lobby.current_track_index - 1
             lobby.ready_users.clear() # Clear ready status on track change
             # lobby.start_time = time.time()
         await broadcast_player_sync(lobby)
@@ -315,6 +322,10 @@ async def websocket_read_message(user: ConnectedUser):
             return
         lobby.is_shuffled = not lobby.is_shuffled
         await broadcast_player_sync(lobby)
+
+    elif mes["type"] == "update_user_settings":
+        if "autoplay" in mes:
+            user.autoplay = mes["autoplay"]
 
     elif mes["type"] == "set_owner":
         
